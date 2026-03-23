@@ -1,18 +1,30 @@
 """
-config.py — Central configuration for the HMM-LSTM crypto trading workflow.
-Fill in your Roostoo API credentials before running live_trading.py.
+config.py — HMM-only crypto trading workflow.
 
-Adding / removing instruments
-------------------------------
-  1. Add or remove a (binance_symbol, roostoo_pair) tuple in TRADING_INSTRUMENTS.
-  2. Add the matching TestInstrumentProvider factory in INSTRUMENT_PROVIDERS.
-  That is all — fetch_data, backtest, live_trading, and evaluate_models will
-  automatically pick up every change with no further edits required.
+Adding a new trading pair
+--------------------------
+Simply append a tuple to TRADING_INSTRUMENTS below:
+
+    ("SOLUSDT", "SOL/USD"),
+
+That is the ONLY file you need to edit.  Instrument definitions are fetched
+automatically from Binance at runtime — no code changes in any other file.
+
+Roostoo pair availability
+--------------------------
+The mock Roostoo platform supports a limited set of pairs.
+Run  GET https://mock-api.roostoo.com/v3/exchangeInfo  to see what is live.
+For backtesting the Roostoo pair is not used, so you can add any Binance
+symbol freely.  For live trading ensure the Roostoo pair exists on the mock
+exchange first.
+
+Fill in your Roostoo API credentials in the ROOSTOO section before running
+live_trading.py.
 """
 
 from decimal import Decimal
+from datetime import datetime, timedelta
 from pathlib import Path
-from datetime import datetime
 
 # ── Directories ───────────────────────────────────────────────────────────────
 BASE_DIR     = Path(__file__).parent
@@ -25,51 +37,59 @@ RESULTS_DIR  = BASE_DIR / "results"
 for _d in [DATA_DIR, CATALOG_PATH, MODEL_DIR, LOG_DIR, RESULTS_DIR]:
     _d.mkdir(parents=True, exist_ok=True)
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  INSTRUMENTS — the only section you need to edit to add / remove assets
+#  INSTRUMENTS  ← edit this list to add / remove pairs
 # ══════════════════════════════════════════════════════════════════════════════
-
-# Step 1 ── List every (Binance symbol, Roostoo pair) you want to trade.
+#
+# Format: (BINANCE_SPOT_SYMBOL, ROOSTOO_PAIR)
+#
+# Any Binance Spot USDT pair is valid here — instrument specs are fetched
+# automatically from Binance via utils/binance_instruments.py.
+# The disk cache (INSTRUMENT_CACHE_PATH) means Binance is only queried once
+# per machine; subsequent runs load from the pickle file in < 1 ms.
+#
+# Examples of valid Binance Spot symbols:
+#   BTCUSDT  ETHUSDT  BNBUSDT  SOLUSDT  XRPUSDT  DOGEUSDT  ADAUSDT
+#   AVAXUSDT DOTUSDT  LINKUSDT LTCUSDT  MATICUSDT SHIBUSDT  TRXUSDT
+#   UNIUSDT  ATOMUSDT FILUSDT  NEARUSDT APTUSDT   ARBUSDT   OPUSDT
+#
 TRADING_INSTRUMENTS: list[tuple[str, str]] = [
     ("BTCUSDT", "BTC/USD"),
-    ("SOLUSDT", "SOL/USD"),
-    # ("SOLUSDT", "SOL/USD"),  ← uncomment (and add provider below) to add SOL
+    ("ETHUSDT", "ETH/USD"),
+    ("BNBUSDT", "BNB/USD"),
+    # ── Add any pair below — no other files need to change ──────────────────
+    # ("SOLUSDT",   "SOL/USD"),
+    # ("XRPUSDT",   "XRP/USD"),
+    ("DOGEUSDT",  "DOGE/USD"),
+    # ("ADAUSDT",   "ADA/USD"),
+    ("AVAXUSDT",  "AVAX/USD"),
+    ("DOTUSDT",   "DOT/USD"),
+    ("LINKUSDT",  "LINK/USD"),
+    ("LTCUSDT",   "LTC/USD"),
 ]
 
-# Step 2 ── For each symbol above, provide its NautilusTrader instrument
-# factory.  Used by fetch_data.py and backtest.py only (not live trading).
-def _build_instrument_providers() -> dict:
-    from nautilus_trader.test_kit.providers import TestInstrumentProvider
-    return {
-        "BTCUSDT": TestInstrumentProvider.btcusdt_binance,
-        "SOLUSDT": TestInstrumentProvider.ethusdt_binance,
-        # "SOLUSDT": TestInstrumentProvider.solusdt_binance,  ← add here too
-    }
-
-INSTRUMENT_PROVIDERS: dict = _build_instrument_providers()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Bar specification — shared across all instruments
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Bar specification ─────────────────────────────────────────────────────────
 VENUE           = "BINANCE"
-BAR_STEP        = 15             # ← changed from 1 to 15 (15-minute bars)
-BAR_AGGREGATION = "MINUTE"       # must match a BarAggregation enum name
-BAR_PRICE_TYPE  = "LAST"         # must match a PriceType enum name
+BAR_STEP        = 15
+BAR_AGGREGATION = "MINUTE"
+BAR_PRICE_TYPE  = "LAST"
+
+# ── Instrument disk cache ─────────────────────────────────────────────────────
+# Binance instrument specs (price_precision, size_precision, lot sizes, etc.)
+# are cached here so the exchange-info API is only called ONCE per machine.
+# Delete this file to force a refresh (e.g. after Binance updates tick sizes).
+INSTRUMENT_CACHE_PATH = DATA_DIR / "instrument_cache.pkl"
 
 
-# ── Derived instrument configs (auto-generated — do not edit) ─────────────────
 def _build_instrument_configs() -> list[dict]:
+    """Derive per-instrument metadata from TRADING_INSTRUMENTS."""
     configs = []
     for binance_symbol, roostoo_pair in TRADING_INSTRUMENTS:
-        # Derive a short ticker: BTCUSDT → btc, ETHUSDT → eth, SOLUSDT → sol …
         ticker = binance_symbol.lower()
-        for suffix in ("usdt", "usd", "busd", "usdc", ):
+        for suffix in ("usdt", "usd", "busd", "usdc"):
             if ticker.endswith(suffix):
                 ticker = ticker[: -len(suffix)]
                 break
-
         instrument_id_str = f"{binance_symbol}.{VENUE}"
         bar_type_str = (
             f"{instrument_id_str}-{BAR_STEP}-{BAR_AGGREGATION}"
@@ -78,82 +98,75 @@ def _build_instrument_configs() -> list[dict]:
         configs.append({
             "binance_symbol":    binance_symbol,
             "roostoo_pair":      roostoo_pair,
-            "ticker":            ticker,                            # "btc", "eth" …
-            "instrument_id_str": instrument_id_str,                 # "BTCUSDT.BINANCE"
+            "ticker":            ticker,
+            "instrument_id_str": instrument_id_str,
             "bar_type_str":      bar_type_str,
             "hmm_model_path":    MODEL_DIR / f"hmm_{ticker}.pkl",
-            "lstm_model_path":   MODEL_DIR / f"lstm_{ticker}.pt",
         })
     return configs
 
 
-INSTRUMENTS:    list[dict]        = _build_instrument_configs()
-INSTRUMENT_MAP: dict[str, dict]   = {i["instrument_id_str"]: i for i in INSTRUMENTS}
-SYMBOL_MAP:     dict[str, dict]   = {i["binance_symbol"]:    i for i in INSTRUMENTS}
-
+INSTRUMENTS:    list[dict]      = _build_instrument_configs()
+INSTRUMENT_MAP: dict[str, dict] = {i["instrument_id_str"]: i for i in INSTRUMENTS}
+SYMBOL_MAP:     dict[str, dict] = {i["binance_symbol"]:    i for i in INSTRUMENTS}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Roostoo API
 # ══════════════════════════════════════════════════════════════════════════════
-ROOSTOO_BASE_URL    = "https://mock-api.roostoo.com"
-ROOSTOO_API_KEY     = "YOUR_API_KEY_HERE"       # ← replace
-ROOSTOO_SECRET_KEY  = "YOUR_SECRET_KEY_HERE"    # ← replace
-ROOSTOO_AMOUNT_PREC = 6                         # decimal places for asset qty
+ROOSTOO_BASE_URL   = "https://mock-api.roostoo.com"
+ROOSTOO_API_KEY    = "TBshw3KMSyYWso0poqwML2GiXdd5Y0bB7b7mveomD1jvtV0mf0T0G5VeZNNphAwg"    # ← replace before live trading
+ROOSTOO_SECRET_KEY = "NIKGWlW8AYGRj0VHjnijU46No6A6ha1HZvY9qgdvuozH9zPFh56oXs70ITlz7KBt" # ← replace before live trading
 
-# ── Data Periods ──────────────────────────────────────────────────────────────
-FETCH_START      = "2023-10-01"
-FETCH_END        = "2025-12-31"
-BACKTEST_START   = "2026-03-10"
-BACKTEST_END     = datetime.now().strftime("%Y-%m-%d")
+# ── Data periods ──────────────────────────────────────────────────────────────
+FETCH_START = "2021-01-01"
+FETCH_END   = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+BACKTEST_START = "2026-03-01"   # ← update after retraining; must be > FETCH_START
+BACKTEST_END   = "2026-03-21"   # ← fixed; update manually after re-fetching data
+
 STARTING_BALANCE = 1_000_000.0
-
-# ── Fear & Greed Index ────────────────────────────────────────────────────────
-# Sourced from the free Alternative.me public API — no API key required.
-# The index is published once per day (one integer value 0–100).
-# fetch_data.py stores the full filtered history at FEAR_GREED_PATH as Parquet.
-# Downstream files (train_models, backtest, live_trading) read it from disk;
-# they should join on the UTC date of each bar to get the daily value.
-FEAR_GREED_URL  = "https://api.alternative.me/fng/"
-FEAR_GREED_PATH = DATA_DIR / "fear_greed.parquet"
 
 # ── HMM ───────────────────────────────────────────────────────────────────────
 HMM_N_STATES    = 3
 HMM_N_ITER      = 300
 HMM_COVARIANCE  = "full"
-HMM_MIN_HISTORY = 200
+HMM_MIN_HISTORY = 150
 
-# ── LSTM ──────────────────────────────────────────────────────────────────────
-LSTM_LOOKBACK            = 60
-LSTM_PREDICTION_HORIZON  = 5
-LSTM_HIDDEN_SIZE         = 128
-LSTM_NUM_LAYERS          = 2
-LSTM_DROPOUT             = 0.25
-LSTM_EPOCHS              = 100
-LSTM_BATCH_SIZE          = 64
-LSTM_LR                  = 0.001
-LSTM_VAL_SPLIT           = 0.15
-LSTM_EARLY_STOP_PATIENCE = 12
+# ── Live warm-up ──────────────────────────────────────────────────────────────
+# Number of historical 15-min bars to pre-fetch from Binance REST on startup.
+# Must be >= HMM_MIN_HISTORY.  50-bar buffer absorbs any gaps or stale bars.
+# Set to 0 to disable (not recommended for live trading).
+# Backtest is unaffected — the strategy config defaults warmup_bars=0 there.
+WARMUP_BARS = HMM_MIN_HISTORY + 50   # ← NEW
 
-# ── Kelly / Risk ──────────────────────────────────────────────────────────────
-KELLY_FRACTION          = 0.40
-MAX_POSITION_PCT        = 0.65
-MIN_CONFIDENCE_ENTRY    = 0.53
-MIN_CONFIDENCE_EXIT     = 0.47
-EXPECTED_WIN_LOSS_RATIO = 2.67
+# ── Entry ─────────────────────────────────────────────────────────────────────
+MIN_BULL_PROBA          = 0.45
+MIN_KELLY_FRACTION      = 0.005
+TREND_EMA_BARS          = 48
+TREND_LOOKBACK_BARS     = 96
+BULL_ENTRY_CONSECUTIVE  = 2
+BEAR_EXIT_CONSECUTIVE   = 2
 
-STOP_LOSS_PCT      = 0.015
-TAKE_PROFIT_PCT    = 0.040
-TRAILING_STOP_PCT  = 0.020
+# ── Kelly / position sizing ───────────────────────────────────────────────────
+KELLY_FRACTION     = 0.40
+MAX_POSITION_PCT   = 0.70
+COMMISSION_RATE    = 0.001
+
+# ── Exit ──────────────────────────────────────────────────────────────────────
+TAKE_PROFIT_PCT    = 0.030
+TRAIL_BULL_PCT     = 0.020
+TRAIL_SIDEWAYS_PCT = 0.012
+TRAIL_BEAR_PCT     = 0.006
+BEAR_EXIT_PROBA    = 0.40
+MAX_HOLDING_BARS   = 192
+
+# ── Re-entry cooldown ─────────────────────────────────────────────────────────
+MIN_BARS_BETWEEN_TRADES = 8
 
 # ── Commission ────────────────────────────────────────────────────────────────
 TAKER_FEE = Decimal("0.001")
-MAKER_FEE = Decimal("0.0005")
 
-# ── Live Trading ──────────────────────────────────────────────────────────────
+# ── Live trading ──────────────────────────────────────────────────────────────
 LOOP_SLEEP_SECS    = 5
 BALANCE_SYNC_BARS  = 15
 ORDER_TIMEOUT_SECS = 30
-
-# ── Diagnostics ───────────────────────────────────────────────────────────────
-WALK_FORWARD_BARS = 3_000
-WALK_FORWARD_STEP = 500

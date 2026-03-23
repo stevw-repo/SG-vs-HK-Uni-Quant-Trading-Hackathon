@@ -1,20 +1,21 @@
 """
 fetch_data.py
 Download historical Binance OHLCV bars for ALL instruments defined in
-config.TRADING_INSTRUMENTS and the daily Fear & Greed Index from
-Alternative.me, then persist everything to disk.
-
-Bar data  → local ParquetDataCatalog (cfg.CATALOG_PATH)
-F&G data  → Parquet file             (cfg.FEAR_GREED_PATH)
-
-To fetch data for a new asset, add it to TRADING_INSTRUMENTS in config.py and
-re-run this script — no other changes are needed.
+config.TRADING_INSTRUMENTS and persist them to the local ParquetDataCatalog.
 
 Usage
 -----
     python fetch_data.py
     python fetch_data.py --start 2023-10-01 --end 2024-04-30
     python fetch_data.py --start 2023-10-01 --end 2024-04-30 --reset
+    python fetch_data.py --refresh-instruments
+
+Changelog vs. previous version
+--------------------------------
+- FIXED: is_testnet=False → environment=BinanceEnvironment.LIVE on the
+  get_cached_binance_http_client() call for the klines HTTP client.
+  Same root cause as binance_instruments.py — the nightly build removed
+  is_testnet in favour of the BinanceEnvironment enum.
 """
 
 from __future__ import annotations
@@ -23,23 +24,30 @@ import argparse
 import asyncio
 import logging
 import shutil
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import aiohttp
 import pandas as pd
 
-from nautilus_trader.adapters.binance.common.enums import BinanceAccountType, BinanceKlineInterval
-from nautilus_trader.adapters.binance.http.client import BinanceHttpClient
+from nautilus_trader.adapters.binance import get_cached_binance_http_client
+from nautilus_trader.adapters.binance.common.enums import (
+    BinanceAccountType,
+    BinanceEnvironment,
+    BinanceKlineInterval,
+)
 from nautilus_trader.adapters.binance.spot.http.market import BinanceSpotMarketHttpAPI
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.model.data import Bar, BarSpecification, BarType
 from nautilus_trader.model.enums import AggregationSource, BarAggregation, PriceType
+from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 import config as cfg
+from utils.binance_instruments import (
+    load_binance_instruments_async,
+    save_instrument_cache,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,31 +57,29 @@ logger = logging.getLogger("fetch_data")
 
 KLINES_PER_REQUEST = 1000
 
-# ── Map (BAR_STEP, BAR_AGGREGATION) → Binance kline interval enum ─────────────
+# ── Bar interval map ──────────────────────────────────────────────────────────
 _KLINE_INTERVAL_MAP: dict[tuple[int, str], BinanceKlineInterval] = {
-    (1,  "MINUTE"):  BinanceKlineInterval.MINUTE_1,
-    (3,  "MINUTE"):  BinanceKlineInterval.MINUTE_3,
-    (5,  "MINUTE"):  BinanceKlineInterval.MINUTE_5,
-    (15, "MINUTE"):  BinanceKlineInterval.MINUTE_15,
-    (30, "MINUTE"):  BinanceKlineInterval.MINUTE_30,
-    (60, "MINUTE"):  BinanceKlineInterval.HOUR_1,
+    (1,  "MINUTE"): BinanceKlineInterval.MINUTE_1,
+    (3,  "MINUTE"): BinanceKlineInterval.MINUTE_3,
+    (5,  "MINUTE"): BinanceKlineInterval.MINUTE_5,
+    (15, "MINUTE"): BinanceKlineInterval.MINUTE_15,
+    (30, "MINUTE"): BinanceKlineInterval.MINUTE_30,
+    (60, "MINUTE"): BinanceKlineInterval.HOUR_1,
 }
-
-# Duration of one bar in milliseconds — derived from config, not hardcoded
 _BAR_MS_MAP: dict[tuple[int, str], int] = {
-    (1,  "MINUTE"):       60_000,
-    (3,  "MINUTE"):      180_000,
-    (5,  "MINUTE"):      300_000,
-    (15, "MINUTE"):      900_000,
-    (30, "MINUTE"):    1_800_000,
-    (60, "MINUTE"):    3_600_000,
+    (1,  "MINUTE"):    60_000,
+    (3,  "MINUTE"):   180_000,
+    (5,  "MINUTE"):   300_000,
+    (15, "MINUTE"):   900_000,
+    (30, "MINUTE"): 1_800_000,
+    (60, "MINUTE"): 3_600_000,
 }
 
 _interval_key = (cfg.BAR_STEP, cfg.BAR_AGGREGATION)
 if _interval_key not in _KLINE_INTERVAL_MAP:
     raise ValueError(
         f"Unsupported BAR_STEP / BAR_AGGREGATION in config: {_interval_key}. "
-        f"Supported combinations: {list(_KLINE_INTERVAL_MAP.keys())}"
+        f"Supported: {list(_KLINE_INTERVAL_MAP.keys())}"
     )
 
 KLINE_INTERVAL: BinanceKlineInterval = _KLINE_INTERVAL_MAP[_interval_key]
@@ -83,7 +89,6 @@ BAR_DURATION_MS: int                 = _BAR_MS_MAP[_interval_key]
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def dt_to_ms(dt_str: str) -> int:
-    """Convert 'YYYY-MM-DD' string to millisecond UTC timestamp."""
     return int(
         datetime.strptime(dt_str, "%Y-%m-%d")
         .replace(tzinfo=timezone.utc)
@@ -95,7 +100,7 @@ def ms_to_ns(ms: int) -> int:
     return ms * 1_000_000
 
 
-# ── Kline fetching ────────────────────────────────────────────────────────────
+# ── Kline pagination ──────────────────────────────────────────────────────────
 
 async def fetch_klines_range(
     market_api: BinanceSpotMarketHttpAPI,
@@ -103,10 +108,6 @@ async def fetch_klines_range(
     start_ms:   int,
     end_ms:     int,
 ) -> list[dict]:
-    """
-    Paginate the Binance klines endpoint to cover the full [start_ms, end_ms)
-    range for a single symbol.  Returns a list of raw kline dicts.
-    """
     all_klines: list[dict] = []
     current = start_ms
 
@@ -128,7 +129,9 @@ async def fetch_klines_range(
         )
 
         if not klines:
-            logger.warning("Empty response for %s range %d – %d", symbol, current, batch_end)
+            logger.warning(
+                "Empty response for %s %d – %d", symbol, current, batch_end
+            )
             break
 
         for k in klines:
@@ -143,7 +146,6 @@ async def fetch_klines_range(
                     "close_time": int(k.close_time),
                 })
             else:
-                # Raw list/tuple format: [open_time, open, high, low, close, volume, …]
                 all_klines.append({
                     "open_time":  int(k[0]),
                     "open":       float(k[1]),
@@ -158,8 +160,7 @@ async def fetch_klines_range(
         if last_ts + BAR_DURATION_MS >= end_ms:
             break
         current = last_ts + BAR_DURATION_MS
-
-        await asyncio.sleep(0.25)   # polite rate limiting
+        await asyncio.sleep(0.25)
 
     return all_klines
 
@@ -189,28 +190,29 @@ def klines_to_bars(
     return bars
 
 
-# ── Per-instrument fetch ───────────────────────────────────────────────────────
+# ── Per-instrument fetch ──────────────────────────────────────────────────────
 
 async def fetch_instrument(
-    market_api: BinanceSpotMarketHttpAPI,
-    catalog:    ParquetDataCatalog,
-    inst_cfg:   dict,
-    start_ms:   int,
-    end_ms:     int,
+    market_api:  BinanceSpotMarketHttpAPI,
+    catalog:     ParquetDataCatalog,
+    inst_cfg:    dict,
+    start_ms:    int,
+    end_ms:      int,
+    symbol_map:  dict[str, Instrument],
 ) -> None:
-    """Fetch, convert, and persist all bars for one instrument config dict."""
-    symbol = inst_cfg["binance_symbol"]
+    symbol     = inst_cfg["binance_symbol"]
+    instrument = symbol_map.get(symbol)
 
-    provider_fn = cfg.INSTRUMENT_PROVIDERS.get(symbol)
-    if provider_fn is None:
+    if instrument is None:
+        sample = sorted(symbol_map.keys())[:12]
         logger.error(
-            "No INSTRUMENT_PROVIDERS entry for '%s'. "
-            "Add one to config.py and re-run.",
-            symbol,
+            "[%s] Not found in Binance Spot exchange info.  "
+            "Verify the symbol spelling in config.TRADING_INSTRUMENTS.  "
+            "Sample valid symbols: %s",
+            symbol, sample,
         )
         return
 
-    instrument = provider_fn()
     bar_type = BarType(
         instrument_id=instrument.id,
         bar_spec=BarSpecification(
@@ -242,176 +244,137 @@ async def fetch_instrument(
 
     catalog.write_data([instrument])
     catalog.write_data(bars)
+
     logger.info(
-        "%s: wrote %d bars to catalog  (%s → %s)",
+        "%s: wrote %d bars  |  price_precision=%d  size_precision=%d  (%s → %s)",
         symbol,
         len(bars),
+        instrument.price_precision,
+        instrument.size_precision,
         pd.Timestamp(klines[0]["open_time"],  unit="ms", tz="UTC").strftime("%Y-%m-%d"),
         pd.Timestamp(klines[-1]["open_time"], unit="ms", tz="UTC").strftime("%Y-%m-%d"),
     )
 
 
-# ── Fear & Greed Index fetch ──────────────────────────────────────────────────
-
-async def fetch_fear_and_greed(start: str, end: str) -> None:
-    """
-    Download the full Fear & Greed Index history from Alternative.me
-    (https://api.alternative.me/fng/), filter to [start, end), and save the
-    result as a Parquet file at cfg.FEAR_GREED_PATH.
-
-    The API is free and requires no authentication.  It returns one record per
-    calendar day, each containing:
-
-      date            — UTC midnight timestamp (tz-aware pd.Timestamp)
-      timestamp_ns    — same moment in nanoseconds (int64, for NautilusTrader)
-      value           — Fear & Greed score 0–100 (int)
-      classification  — e.g. "Extreme Fear", "Fear", "Neutral",
-                        "Greed", "Extreme Greed"
-
-    Downstream consumers (train_models, backtest, live_trading) should load
-    this file with pd.read_parquet(cfg.FEAR_GREED_PATH) and merge on the UTC
-    date of each bar to obtain the day's F&G value.
-    """
-    logger.info("Fetching Fear & Greed Index from %s …", cfg.FEAR_GREED_URL)
-
-    # limit=0 requests the maximum available history (since Feb 2018).
-    # date_format="" keeps the timestamp field as a plain Unix integer string,
-    # which we parse ourselves for full control.
-    params = {"limit": 0, "format": "json", "date_format": ""}
-    timeout = aiohttp.ClientTimeout(total=30)
-
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(cfg.FEAR_GREED_URL, params=params) as resp:
-            resp.raise_for_status()
-            # content_type=None because the API sometimes returns text/html
-            # even for valid JSON payloads.
-            payload = await resp.json(content_type=None)
-
-    records = payload.get("data", [])
-    if not records:
-        raise RuntimeError(
-            "Fear & Greed API returned an empty 'data' list. "
-            "The endpoint may be temporarily unavailable."
-        )
-
-    # Build a tidy DataFrame from the raw records.
-    df = pd.DataFrame(records)
-
-    # Keep only the columns we care about; rename for clarity.
-    df = df[["timestamp", "value", "value_classification"]].copy()
-    df["timestamp"]  = df["timestamp"].astype(int)
-    df["value"]      = df["value"].astype(int)
-
-    # Derive tz-aware UTC date and nanosecond timestamp for NautilusTrader.
-    df["date"]         = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.normalize()
-    df["timestamp_ns"] = df["timestamp"] * 1_000_000_000
-
-    df = (
-        df[["date", "timestamp_ns", "value", "value_classification"]]
-        .rename(columns={"value_classification": "classification"})
-        .sort_values("date")
-        .reset_index(drop=True)
-    )
-
-    # Filter to the requested date range.
-    start_ts = pd.Timestamp(start, tz="UTC")
-    end_ts   = pd.Timestamp(end,   tz="UTC")
-    df = df[(df["date"] >= start_ts) & (df["date"] < end_ts)].reset_index(drop=True)
-
-    if df.empty:
-        logger.warning(
-            "Fear & Greed: no records found between %s and %s after filtering. "
-            "The index only goes back to February 2018.",
-            start, end,
-        )
-    else:
-        logger.info(
-            "Fear & Greed: %d daily records  (%s → %s)",
-            len(df),
-            df["date"].iloc[0].strftime("%Y-%m-%d"),
-            df["date"].iloc[-1].strftime("%Y-%m-%d"),
-        )
-
-    df.to_parquet(cfg.FEAR_GREED_PATH, index=False)
-    logger.info("Fear & Greed Index saved → %s", cfg.FEAR_GREED_PATH)
-
-
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-async def main(start: str, end: str, reset_catalog: bool = False) -> None:
+async def main(
+    start:               str,
+    end:                 str,
+    reset_catalog:       bool = False,
+    refresh_instruments: bool = False,
+) -> None:
 
-    # ── Optional reset ────────────────────────────────────────────────────────
     if reset_catalog:
         if cfg.CATALOG_PATH.exists():
             shutil.rmtree(cfg.CATALOG_PATH)
             logger.info("Cleared existing catalog at %s", cfg.CATALOG_PATH)
-        if cfg.FEAR_GREED_PATH.exists():
-            cfg.FEAR_GREED_PATH.unlink()
-            logger.info("Cleared existing Fear & Greed data at %s", cfg.FEAR_GREED_PATH)
 
     cfg.CATALOG_PATH.mkdir(parents=True, exist_ok=True)
     catalog = ParquetDataCatalog(cfg.CATALOG_PATH)
 
+    if refresh_instruments and cfg.INSTRUMENT_CACHE_PATH.exists():
+        cfg.INSTRUMENT_CACHE_PATH.unlink()
+        logger.info("Instrument disk cache cleared — will re-fetch from Binance.")
+
+    # Load ALL Binance Spot instruments ONCE (no API key needed)
+    symbol_map = await load_binance_instruments_async()
+
+    if not symbol_map:
+        logger.error(
+            "No instruments could be loaded from Binance.  "
+            "Check network connectivity and try again."
+        )
+        return
+
+    symbols   = [i["binance_symbol"] for i in cfg.INSTRUMENTS]
+    resolved  = {sym: symbol_map[sym] for sym in symbols if sym in symbol_map}
+    missing_s = [sym for sym in symbols if sym not in symbol_map]
+
+    if missing_s:
+        logger.error(
+            "Symbols from config NOT found on Binance Spot (check spelling): %s.  "
+            "Sample valid symbols: %s",
+            missing_s, sorted(symbol_map.keys())[:12],
+        )
+
+    if resolved:
+        save_instrument_cache(cfg.INSTRUMENT_CACHE_PATH, resolved)
+        logger.info(
+            "Instrument disk cache updated → %s  (%d symbols)",
+            cfg.INSTRUMENT_CACHE_PATH, len(resolved),
+        )
+
+    # ── HTTP client for kline requests ────────────────────────────────────────
+    # environment=BinanceEnvironment.LIVE replaces the removed is_testnet=False
     clock       = LiveClock()
-    http_client = BinanceHttpClient(
-    clock=clock,
-    api_key="",
-    api_secret="",
-    base_url="https://api.binance.com",
-)
-    market_api  = BinanceSpotMarketHttpAPI(
-        client=http_client,
+    klines_http = get_cached_binance_http_client(
+        clock=clock,
+        account_type=BinanceAccountType.SPOT,
+        api_key=None,
+        api_secret=None,
+        environment=BinanceEnvironment.LIVE,   # ← FIXED (was is_testnet=False)
+    )
+    market_api = BinanceSpotMarketHttpAPI(
+        client=klines_http,
         account_type=BinanceAccountType.SPOT,
     )
 
     start_ms = dt_to_ms(start)
     end_ms   = dt_to_ms(end)
 
-    # ── OHLCV bars (one instrument at a time) ─────────────────────────────────
-    symbols = [i["binance_symbol"] for i in cfg.INSTRUMENTS]
-    logger.info("Fetching %d instrument(s): %s", len(symbols), symbols)
+    logger.info(
+        "Fetching %d instrument(s): %s  |  %s → %s",
+        len(resolved), list(resolved.keys()), start, end,
+    )
 
     for inst_cfg in cfg.INSTRUMENTS:
+        sym = inst_cfg["binance_symbol"]
+        if sym not in resolved:
+            continue
         logger.info("─" * 60)
-        logger.info("Starting fetch for %s", inst_cfg["binance_symbol"])
+        logger.info("Fetching bars for  %s", sym)
         await fetch_instrument(
             market_api=market_api,
             catalog=catalog,
             inst_cfg=inst_cfg,
             start_ms=start_ms,
             end_ms=end_ms,
+            symbol_map=symbol_map,
         )
-        await asyncio.sleep(1.0)   # brief pause between instruments
+        await asyncio.sleep(1.0)
 
-    await asyncio.sleep(1.0)
-
-    # ── Fear & Greed Index ────────────────────────────────────────────────────
-    logger.info("─" * 60)
-    await fetch_fear_and_greed(start=start, end=end)
-
-    # ── Summary ───────────────────────────────────────────────────────────────
     logger.info("=" * 60)
     logger.info(
-        "Done. Catalog at: %s  |  instruments: %s", cfg.CATALOG_PATH, symbols
+        "Done.  Catalog: %s  |  instruments fetched: %s",
+        cfg.CATALOG_PATH, list(resolved.keys()),
     )
-    logger.info("Fear & Greed Index at: %s", cfg.FEAR_GREED_PATH)
     logger.info("=" * 60)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description=(
-            "Fetch Binance historical bars and the Fear & Greed Index "
-            "for all configured instruments."
-        )
+        description="Fetch Binance historical bars for all configured instruments."
     )
-    parser.add_argument("--start", default=cfg.FETCH_START, help="Start date YYYY-MM-DD")
-    parser.add_argument("--end",   default=cfg.FETCH_END,   help="End date YYYY-MM-DD")
+    parser.add_argument("--start",  default=cfg.FETCH_START, help="Start date YYYY-MM-DD")
+    parser.add_argument("--end",    default=cfg.FETCH_END,   help="End date YYYY-MM-DD")
     parser.add_argument(
         "--reset",
         action="store_true",
-        help="Clear existing catalog and Fear & Greed file before fetching",
+        help="Clear the existing catalog before fetching",
+    )
+    parser.add_argument(
+        "--refresh-instruments",
+        action="store_true",
+        help="Force re-fetch of instrument specs from Binance, ignoring disk cache",
     )
     args = parser.parse_args()
 
-    asyncio.run(main(start=args.start, end=args.end, reset_catalog=args.reset))
+    asyncio.run(
+        main(
+            start=args.start,
+            end=args.end,
+            reset_catalog=args.reset,
+            refresh_instruments=args.refresh_instruments,
+        )
+    )

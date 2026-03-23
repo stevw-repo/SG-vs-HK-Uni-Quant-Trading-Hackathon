@@ -31,8 +31,8 @@ class RoostooClient:
 
     def __init__(
         self,
-        api_key:    str,
-        secret_key: str,
+        api_key:    str = "4mBXHQ2ihr5gos7S9dDiXcoxPFNu9RKyoXH91dgXIfqzYI4gjtsUKZGNRAncww91",
+        secret_key: str = "Xyvcu2WL8BtDGfflvePuLYa8P4ZkZ3Pv9THbGfbmP8qAiH4dwJWqz8nVlZOzTA7M",
         base_url:   str = "https://mock-api.roostoo.com",
         timeout:    int = 15,
     ) -> None:
@@ -218,19 +218,19 @@ class RoostooClient:
         data = self.get_balance()
         if not data or not data.get("Success"):
             return 0.0
-        return float(data["Wallet"].get("USD", {}).get("Free", 0.0))
+        return float(data["SpotWallet"].get("USD", {}).get("Free", 0.0))
 
     def free_btc(self) -> float:
         data = self.get_balance()
         if not data or not data.get("Success"):
             return 0.0
-        return float(data["Wallet"].get("BTC", {}).get("Free", 0.0))
+        return float(data["SpotWallet"].get("BTC", {}).get("Free", 0.0))
 
     def total_portfolio_usd(self, btc_price: float) -> float:
         data = self.get_balance()
         if not data or not data.get("Success"):
             return 0.0
-        wallet = data["Wallet"]
+        wallet = data["SpotWallet"]
         usd = float(wallet.get("USD", {}).get("Free", 0.0)) + \
               float(wallet.get("USD", {}).get("Lock", 0.0))
         btc = float(wallet.get("BTC", {}).get("Free", 0.0)) + \

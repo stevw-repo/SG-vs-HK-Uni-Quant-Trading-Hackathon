@@ -1,4 +1,4 @@
 from strategy.roostoo_client import RoostooClient
-from strategy.hmm_lstm_strategy import HMMLSTMStrategy, HMMLSTMStrategyConfig
+from strategy.hmm_strategy import HMMStrategy, HMMStrategyConfig
 
-__all__ = ["RoostooClient", "HMMLSTMStrategy", "HMMLSTMStrategyConfig"]
+__all__ = ["RoostooClient", "HMMStrategy", "HMMStrategyConfig"]
