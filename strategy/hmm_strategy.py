@@ -39,6 +39,28 @@ Fix 6 — on_historical_data() override so request_bars() bars populate deques
   the bar duration from BarType.spec, and pass it as the second positional
   argument.  The callback is still passed as a keyword argument so that
   the completion banner fires once all bars have been delivered.
+
+Fix 7 — _close_long() internal quantity tracking
+  Root cause
+  ----------
+  generate_order_filled() raised TypeError (keyword-argument bug, now
+  fixed in live_trading.py), so NautilusTrader never registered BUY
+  fills.  portfolio.net_position() therefore returned 0, triggering the
+  guard in _close_long():
+
+      if net_qty is None or float(net_qty) <= 0: return   # ← no SELL sent
+
+  self._is_long was reset to False, the strategy re-entered after cooldown
+  with another BUY, and Roostoo accumulated open BUY positions with no
+  corresponding SELL orders — appearing as if a BUY had been placed when
+  a SELL was expected.
+
+  Fix: track the purchased quantity in self._current_qty at entry time.
+  _close_long() now falls back to self._current_qty when
+  portfolio.net_position() returns 0, ensuring a SELL is always sent
+  for every confirmed BUY.  self._current_qty is reset to 0.0 on every
+  close path (whether a real SELL is submitted or truly no position
+  exists).
 """
 
 from __future__ import annotations
@@ -90,21 +112,21 @@ class HMMStrategyConfig(StrategyConfig, frozen=True):
     min_kelly_fraction:      float = 0.005
 
     # EMA trend filter (short-term: close > EMA(trend_ema_bars))
-    trend_ema_bars:          int   = 48
+    trend_ema_bars:          int   = 2
 
     # 48-hour trend alignment
-    trend_lookback_bars:     int   = 96
+    trend_lookback_bars:     int   = 4
 
     # BULL entry persistence
     bull_entry_consecutive:  int   = 2
 
     # Kelly / position sizing
-    kelly_fraction:          float = 0.40
+    kelly_fraction:          float = 0.70
     max_position_pct:        float = 0.70
     commission_rate:         float = 0.001
 
     # Exit — take-profit
-    take_profit_pct:         float = 0.040
+    take_profit_pct:         float = 0.030
 
     # Exit — regime-adjusted trailing stops from peak
     trail_bull_pct:          float = 0.020
@@ -125,7 +147,7 @@ class HMMStrategyConfig(StrategyConfig, frozen=True):
     hmm_min_history:         int   = 150
 
     # Balance fallback
-    starting_balance_usd:    float = 50_000.0
+    starting_balance_usd:    float = 1_000_000.0
 
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
@@ -174,6 +196,13 @@ class HMMStrategy(Strategy):
         self._tp_price:         float = 0.0
         self._peak_price:       float = 0.0
         self._bars_in_position: int   = 0
+
+        # ── FIX 7: internally tracked buy quantity ────────────────────────────
+        # Set to the purchased qty in _check_entry(); used as a fallback in
+        # _close_long() when portfolio.net_position() returns 0 (e.g. because
+        # the fill event was not registered due to the generate_order_filled()
+        # keyword-argument bug).  Reset to 0.0 on every close path.
+        self._current_qty: float = 0.0
 
         # Bar / trade counters
         self._bar_count:      int = 0   # live bars only (on_bar)
@@ -712,6 +741,8 @@ class HMMStrategy(Strategy):
         self._consecutive_bear_bars  = 0
         self._consecutive_bull_bars  = 0
         self._trade_count           += 1
+        # ── FIX 7: record quantity so _close_long() can fall back to it ───────
+        self._current_qty            = qty
 
         if self._journal is not None:
             self._journal.open_trade(
@@ -794,14 +825,48 @@ class HMMStrategy(Strategy):
         instrument = self.cache.instrument(self._instrument_id)
         if instrument is None:
             self._is_long                = False
+            self._current_qty            = 0.0
             self._consecutive_bear_bars  = 0
             self._consecutive_bull_bars  = 0
             self._bars_in_position       = 0
             return
 
-        net_qty = self.portfolio.net_position(self._instrument_id)
-        if net_qty is None or float(net_qty) <= 0:
+        # ── FIX 7: robust quantity resolution ────────────────────────────────
+        #
+        # Primary source: NautilusTrader portfolio (reflects confirmed fills).
+        # Fallback:       self._current_qty (set at entry time).
+        #
+        # The fallback fires when portfolio.net_position() returns 0 because
+        # the fill event was not registered (e.g. due to the
+        # generate_order_filled() keyword-argument bug that has since been
+        # fixed in live_trading.py).  Without the fallback, _close_long()
+        # would silently skip the SELL order, leave the Roostoo position open,
+        # reset _is_long to False, and allow the strategy to re-enter with
+        # another BUY — resulting in multiple unclosed BUY positions on
+        # Roostoo with no corresponding SELL orders.
+        net_qty   = self.portfolio.net_position(self._instrument_id)
+        qty_float = float(net_qty) if net_qty is not None else 0.0
+
+        if qty_float <= 0.0 and self._current_qty > 0.0:
+            logger.warning(
+                "[%s] _close_long: portfolio.net_position() returned %s "
+                "— falling back to internally tracked qty=%.8f for SELL. "
+                "If this persists after restarting, check that "
+                "generate_order_filled() is being called correctly.",
+                self._strategy_id, net_qty, self._current_qty,
+            )
+            qty_float = self._current_qty
+
+        if qty_float <= 0.0:
+            # Truly no position (e.g. already closed elsewhere) — update
+            # internal state without submitting a redundant SELL order.
+            logger.warning(
+                "[%s] _close_long called but qty=0 and _current_qty=0 "
+                "— no SELL submitted (reason: %s).",
+                self._strategy_id, reason,
+            )
             self._is_long                = False
+            self._current_qty            = 0.0
             self._consecutive_bear_bars  = 0
             self._consecutive_bull_bars  = 0
             self._bars_in_position       = 0
@@ -813,7 +878,7 @@ class HMMStrategy(Strategy):
         order = self.order_factory.market(
             instrument_id = self._instrument_id,
             order_side    = OrderSide.SELL,
-            quantity      = Quantity(float(net_qty), instrument.size_precision),
+            quantity      = Quantity(qty_float, instrument.size_precision),
             time_in_force = TimeInForce.IOC,
         )
 
@@ -830,6 +895,7 @@ class HMMStrategy(Strategy):
         held_bars = self._bars_in_position
 
         self._is_long                = False
+        self._current_qty            = 0.0   # ← reset on every real close
         self._consecutive_bear_bars  = 0
         self._consecutive_bull_bars  = 0
         self._bars_in_position       = 0

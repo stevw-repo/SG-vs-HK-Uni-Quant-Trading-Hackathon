@@ -21,6 +21,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+import config as cfg
 
 try:
     import requests as _req
@@ -30,15 +31,12 @@ except ImportError:
     _HAS_REQUESTS = False
 
 # ─── Default / fallback configuration ─────────────────────────────────────────
-# These are overwritten on every refresh cycle from config.py, so changing
-# config.py while the monitor is running takes effect at the next poll.
 JOURNAL_PATH       = Path("trade_journal.json")
 ROOSTOO_BASE_URL   = "https://mock-api.roostoo.com"
-ROOSTOO_API_KEY    = ""
-ROOSTOO_SECRET_KEY = ""
+ROOSTOO_API_KEY    = cfg.ROOSTOO_API_KEY
+ROOSTOO_SECRET_KEY = cfg.ROOSTOO_SECRET_KEY
 _CONFIGURED_SYMS: list[str] = []
 
-# Try a first-load so we have values before the first refresh fires
 try:
     import config as _cfg_module
     ROOSTOO_BASE_URL   = getattr(_cfg_module, "ROOSTOO_BASE_URL",   ROOSTOO_BASE_URL)
@@ -85,14 +83,14 @@ def reload_config() -> str:
 
 # ─── Symbol helpers ───────────────────────────────────────────────────────────
 
-def _display(journal_sym: str) -> str:
-    """'BTCUSDT.BINANCE' → 'BTCUSDT'"""
-    return journal_sym.split(".")[0]
+def _display(sym: str) -> str:
+    """'BTCUSDT.BINANCE' → 'BTCUSDT',  'BTC/USD' → 'BTC/USD'"""
+    return sym.split(".")[0]
 
 
 def _to_binance(journal_sym: str) -> str:
     """
-    Convert a journal/config symbol to a Binance ticker.
+    Convert a journal/config/Roostoo symbol to a Binance ticker.
       'BTCUSDT.BINANCE' → 'BTCUSDT'
       'BTC/USD'         → 'BTCUSDT'
       'DOGE/USD'        → 'DOGEUSDT'
@@ -105,28 +103,66 @@ def _to_binance(journal_sym: str) -> str:
 
 # ─── Data fetchers ────────────────────────────────────────────────────────────
 
-def _sign(params: dict) -> tuple[dict, str]:
+def _sign(params: dict) -> tuple[dict, str, str]:
+    """
+    Inject a millisecond timestamp, build the canonical sorted query string,
+    and sign it with HMAC-SHA256.
+
+    Returns:
+        params       – original dict with 'timestamp' injected
+        signature    – hex digest for the MSG-SIGNATURE header
+        total_params – the sorted 'key=value&…' string, needed as a raw POST
+                       body for RCL_TopLevelCheck endpoints
+    """
     params = {**params, "timestamp": str(int(time.time() * 1000))}
     total  = "&".join(f"{k}={params[k]}" for k in sorted(params))
     sig    = hmac.new(
         ROOSTOO_SECRET_KEY.encode(), total.encode(), hashlib.sha256
     ).hexdigest()
-    return params, sig
+    return params, sig, total
 
 
-def fetch_wallet() -> tuple[dict, str]:
+def _post_signed(endpoint: str, payload: dict) -> tuple[dict, str]:
     """
-    Returns (SpotWallet dict, error_string).
-    SpotWallet is {} on any error; error_string is "" on success.
-    Uses the ROOSTOO_API_KEY / ROOSTOO_SECRET_KEY globals, which are refreshed
-    from config.py before this is called each cycle.
+    Perform a signed POST to a Roostoo RCL_TopLevelCheck endpoint.
+    The body must be application/x-www-form-urlencoded and the sorted
+    param string is what gets signed, per the API spec.
+
+    Returns (response_json_dict, error_string).
     """
     if not _HAS_REQUESTS:
         return {}, "requests not installed"
     if not ROOSTOO_API_KEY or not ROOSTOO_SECRET_KEY:
         return {}, "API key not configured"
     try:
-        params, sig = _sign({})
+        _, sig, total_params = _sign(payload)
+        r = _req.post(
+            f"{ROOSTOO_BASE_URL}{endpoint}",
+            headers={
+                "RST-API-KEY":   ROOSTOO_API_KEY,
+                "MSG-SIGNATURE": sig,
+                "Content-Type":  "application/x-www-form-urlencoded",
+            },
+            data=total_params,
+            timeout=6,
+        )
+        r.raise_for_status()
+        return r.json(), ""
+    except Exception as exc:
+        return {}, str(exc)
+
+
+def fetch_wallet() -> tuple[dict, str]:
+    """
+    Returns (wallet dict, error_string).
+    Wallet is {} on any error; error_string is "" on success.
+    """
+    if not _HAS_REQUESTS:
+        return {}, "requests not installed"
+    if not ROOSTOO_API_KEY or not ROOSTOO_SECRET_KEY:
+        return {}, "API key not configured"
+    try:
+        params, sig, _ = _sign({})
         r = _req.get(
             f"{ROOSTOO_BASE_URL}/v3/balance",
             headers={"RST-API-KEY": ROOSTOO_API_KEY, "MSG-SIGNATURE": sig},
@@ -136,10 +172,78 @@ def fetch_wallet() -> tuple[dict, str]:
         r.raise_for_status()
         data = r.json()
         if data.get("Success"):
-            return data.get("SpotWallet", {}), ""
+            # API docs use "Wallet"; guard against both key names just in case
+            return data.get("Wallet", data.get("SpotWallet", {})), ""
         return {}, f"Roostoo: {data.get('ErrMsg', 'unknown error')}"
     except Exception as exc:
         return {}, f"wallet: {exc}"
+
+
+def fetch_open_positions() -> tuple[list[dict], str]:
+    """
+    Derive live open positions directly from the Roostoo API.
+
+    Step 1 — GET /v3/balance
+        On a spot exchange any coin with a non-zero Free+Lock balance IS an
+        open position.  USD is skipped; everything else becomes a candidate.
+
+    Step 2 — POST /v3/query_order  (one call per non-zero coin)
+        Walk the order history for that pair, isolate FILLED BUY orders, sort
+        by CreateTimestamp descending, and use FilledAverPrice of the most
+        recent one as the entry price.  If no filled buy exists the entry price
+        is stored as 0.0 and the P&L column will be hidden in the renderer.
+
+    Returns (positions_list, error_string).
+    Each position dict has keys:
+        symbol       – Roostoo pair string, e.g. "BTC/USD"
+        quantity     – total held (Free + Lock)
+        free         – freely tradeable amount
+        lock         – amount locked in pending orders
+        entry_price  – FilledAverPrice of last filled BUY, or 0.0 if unknown
+    """
+    wallet, err = fetch_wallet()
+    if err:
+        return [], err
+
+    positions: list[dict] = []
+
+    for coin, amounts in wallet.items():
+        if coin == "USD":
+            continue
+        free      = float(amounts.get("Free", 0))
+        lock      = float(amounts.get("Lock", 0))
+        total_qty = free + lock
+        if total_qty <= 0:
+            continue
+
+        pair = f"{coin}/USD"
+
+        # ── Resolve entry price from the most-recent filled BUY order ─────
+        entry_price = 0.0
+        data, _ = _post_signed("/v3/query_order", {"pair": pair})
+        if data.get("Success"):
+            orders = data.get("OrderMatched", [])
+            filled_buys = [
+                o for o in orders
+                if o.get("Side") == "BUY" and o.get("Status") == "FILLED"
+            ]
+            if filled_buys:
+                filled_buys.sort(
+                    key=lambda o: o.get("CreateTimestamp", 0), reverse=True
+                )
+                entry_price = float(
+                    filled_buys[0].get("FilledAverPrice", 0.0)
+                )
+
+        positions.append({
+            "symbol":      pair,
+            "quantity":    total_qty,
+            "free":        free,
+            "lock":        lock,
+            "entry_price": entry_price,
+        })
+
+    return positions, ""
 
 
 def fetch_prices(extra_symbols: list[str]) -> tuple[dict[str, float], str]:
@@ -237,11 +341,12 @@ def _rule(win, row: int, ch: str = "─", attr: int = 0) -> int:
 
 def render(
     win,
-    journal:   dict,
-    wallet:    dict,
-    prices:    dict[str, float],
-    refresh:   int,
-    last_errs: list[str],
+    journal:        dict,
+    wallet:         dict,
+    prices:         dict[str, float],
+    open_positions: list[dict],          # ← now passed in from fetch_open_positions()
+    refresh:        int,
+    last_errs:      list[str],
 ) -> None:
     win.erase()
     h, w = win.getmaxyx()
@@ -265,8 +370,7 @@ def render(
 
     trades        = journal.get("trades", [])
     start_bal     = journal.get("starting_balance", 50_000.0)
-    open_trades   = [t for t in trades if     t.get("open")]
-    closed_trades = [t for t in trades if not t.get("open")]
+    closed_trades = [t for t in trades if not t.get("open")]   # journal only used for closed
     btc_px        = prices.get("_BTC_USD", 0.0)
 
     # ── Wallet ────────────────────────────────────────────────────────────────
@@ -324,37 +428,51 @@ def render(
 
     row = _rule(win, row, "─", CYAN)
 
-    # ── Open positions ────────────────────────────────────────────────────────
-    row = _put(win, row, 0, f" OPEN POSITIONS  ({len(open_trades)})", CYAN)
+    # ── Open positions  (live from Roostoo /v3/balance + /v3/query_order) ────
+    row = _put(win, row, 0,
+               f" OPEN POSITIONS  ({len(open_positions)})  [live · Roostoo]", CYAN)
 
-    if open_trades:
+    if open_positions:
         row = _put(win, row, 0,
-                   f"  {'Symbol':<20} {'Entry':>12} {'Now':>12}"
-                   f" {'Qty':>10} {'Unreal P&L':>12} {'Regime':<10} {'Bull%':>6}", YEL)
-        for t in open_trades:
+                   f"  {'Symbol':<14} {'Entry':>12} {'Now':>12}"
+                   f" {'Qty':>14} {'Free':>12} {'Lock':>12} {'Unreal P&L':>14}", YEL)
+        for pos in open_positions:
             if row >= h - 4:
                 break
-            sym      = t.get("symbol",      "?")
-            entry_px = t.get("entry_price", 0.0)
-            qty      = t.get("quantity",    0.0)
-            curr_px  = prices.get(sym, entry_px)
-            unr_u    = (curr_px - entry_px) * qty
-            unr_p    = (curr_px - entry_px) / (entry_px + 1e-12) * 100
-            regime   = t.get("regime",    "?")
-            bull_p   = t.get("bull_prob", 0.0) * 100
-            attr     = GREEN if unr_u >= 0 else RED
-            sign     = "+" if unr_u >= 0 else ""
+            sym      = pos.get("symbol",      "?")
+            entry_px = pos.get("entry_price", 0.0)
+            qty      = pos.get("quantity",    0.0)
+            free     = pos.get("free",        0.0)
+            lock     = pos.get("lock",        0.0)
+            curr_px  = prices.get(sym, 0.0) or entry_px
+
+            if entry_px > 0 and curr_px > 0:
+                unr_u   = (curr_px - entry_px) * qty
+                unr_p   = (curr_px - entry_px) / (entry_px + 1e-12) * 100
+                sign    = "+" if unr_u >= 0 else ""
+                attr    = GREEN if unr_u >= 0 else RED
+                pnl_str = f"{sign}{unr_u:>+12,.2f} ({sign}{unr_p:.2f}%)"
+            else:
+                attr    = NORM
+                pnl_str = "             —"
+
+            ep_str = f"{entry_px:>12,.4f}" if entry_px > 0 else "           —"
+
             row = _put(win, row, 0,
-                       f"  {_display(sym):<20} {entry_px:>12,.4f} {curr_px:>12,.4f}"
-                       f" {qty:>10.6f} {sign}{unr_u:>+11,.2f}"
-                       f" {regime:<10} {bull_p:>5.1f}%", attr)
+                       f"  {_display(sym):<14} {ep_str} {curr_px:>12,.4f}"
+                       f" {qty:>14.6f} {free:>12.6f} {lock:>12.6f}  {pnl_str}",
+                       attr)
     else:
-        row = _put(win, row, 2, " No open positions.", DIM)
+        pos_err = last_errs[4] if len(last_errs) > 4 else ""
+        if pos_err:
+            row = _put(win, row, 2, f" [positions: {pos_err}]", RED)
+        else:
+            row = _put(win, row, 2, " No open positions.", DIM)
 
     row = _rule(win, row, "─", CYAN)
 
-    # ── Closed trade summary ──────────────────────────────────────────────────
-    row = _put(win, row, 0, f" CLOSED TRADES  ({len(closed_trades)})", CYAN)
+    # ── Closed trade summary  (from local journal) ────────────────────────────
+    row = _put(win, row, 0, f" CLOSED TRADES  ({len(closed_trades)})  [journal]", CYAN)
 
     if closed_trades:
         pnls   = [t.get("pnl_usd", 0.0) for t in closed_trades]
@@ -419,11 +537,13 @@ def _curses_main(stdscr, refresh_secs: int) -> None:
     stdscr.nodelay(True)
     _init_colors()
 
-    journal:   dict             = {"starting_balance": 50_000.0, "trades": []}
-    wallet:    dict             = {}
-    prices:    dict[str, float] = {}
-    last_errs: list[str]        = ["", "", "", ""]  # journal, config, wallet, prices
-    last_ts:   float            = 0.0
+    journal:        dict             = {"starting_balance": 50_000.0, "trades": []}
+    wallet:         dict             = {}
+    prices:         dict[str, float] = {}
+    open_positions: list[dict]       = []
+    last_errs:      list[str]        = ["", "", "", "", ""]
+    #                                    journal  config  wallet  prices  positions
+    last_ts:        float            = 0.0
 
     while True:
         key = stdscr.getch()
@@ -435,10 +555,10 @@ def _curses_main(stdscr, refresh_secs: int) -> None:
         now = time.time()
         if now - last_ts >= refresh_secs:
 
-            # 0. Hot-reload config.py ← fixes stale API key after a switch
+            # 0. Hot-reload config.py ← picks up credential changes at runtime
             last_errs[1] = reload_config()
 
-            # 1. Journal
+            # 1. Journal  (closed trade history + starting balance only)
             try:
                 journal = load_journal()
                 last_errs[0] = ""
@@ -448,13 +568,17 @@ def _curses_main(stdscr, refresh_secs: int) -> None:
             # 2. Wallet  (uses freshly reloaded credentials)
             wallet, last_errs[2] = fetch_wallet()
 
-            # 3. Prices
-            journal_syms = list({t["symbol"] for t in journal.get("trades", [])})
-            prices, last_errs[3] = fetch_prices(journal_syms)
+            # 3. Open positions  (Roostoo balance + order history)
+            open_positions, last_errs[4] = fetch_open_positions()
+
+            # 4. Prices  (include Roostoo position symbols so their P&L resolves)
+            journal_syms  = list({t["symbol"] for t in journal.get("trades", [])})
+            position_syms = [p["symbol"] for p in open_positions]
+            prices, last_errs[3] = fetch_prices(journal_syms + position_syms)
 
             last_ts = now
 
-        render(stdscr, journal, wallet, prices, refresh_secs, last_errs)
+        render(stdscr, journal, wallet, prices, open_positions, refresh_secs, last_errs)
         curses.napms(250)
 
 

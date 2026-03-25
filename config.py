@@ -70,7 +70,7 @@ TRADING_INSTRUMENTS: list[tuple[str, str]] = [
 
 # ── Bar specification ─────────────────────────────────────────────────────────
 VENUE           = "BINANCE"
-BAR_STEP        = 15
+BAR_STEP        = 5
 BAR_AGGREGATION = "MINUTE"
 BAR_PRICE_TYPE  = "LAST"
 
@@ -116,13 +116,15 @@ SYMBOL_MAP:     dict[str, dict] = {i["binance_symbol"]:    i for i in INSTRUMENT
 ROOSTOO_BASE_URL   = "https://mock-api.roostoo.com"
 ROOSTOO_API_KEY    = "TBshw3KMSyYWso0poqwML2GiXdd5Y0bB7b7mveomD1jvtV0mf0T0G5VeZNNphAwg"    # ← replace before live trading
 ROOSTOO_SECRET_KEY = "NIKGWlW8AYGRj0VHjnijU46No6A6ha1HZvY9qgdvuozH9zPFh56oXs70ITlz7KBt" # ← replace before live trading
+# ROOSTOO_API_KEY    = "4mBXHQ2ihr5gos7S9dDiXcoxPFNu9RKyoXH91dgXIfqzYI4gjtsUKZGNRAncww91" # ← IGNORE (mock credentials)
+# ROOSTOO_SECRET_KEY = "Xyvcu2WL8BtDGfflvePuLYa8P4ZkZ3Pv9THbGfbmP8qAiH4dwJWqz8nVlZOzTA7M" # ← IGNORE (mock credentials)
 
 # ── Data periods ──────────────────────────────────────────────────────────────
 FETCH_START = "2021-01-01"
 FETCH_END   = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
-BACKTEST_START = "2026-03-01"   # ← update after retraining; must be > FETCH_START
-BACKTEST_END   = "2026-03-21"   # ← fixed; update manually after re-fetching data
+BACKTEST_START = "2026-03-21"   # ← update after retraining; must be > FETCH_START
+BACKTEST_END   = "2026-03-24"   # ← fixed; update manually after re-fetching data
 
 STARTING_BALANCE = 1_000_000.0
 
@@ -142,13 +144,13 @@ WARMUP_BARS = HMM_MIN_HISTORY + 50   # ← NEW
 # ── Entry ─────────────────────────────────────────────────────────────────────
 MIN_BULL_PROBA          = 0.45
 MIN_KELLY_FRACTION      = 0.005
-TREND_EMA_BARS          = 48
-TREND_LOOKBACK_BARS     = 96
+TREND_EMA_BARS          = 2
+TREND_LOOKBACK_BARS     = 4
 BULL_ENTRY_CONSECUTIVE  = 2
 BEAR_EXIT_CONSECUTIVE   = 2
 
 # ── Kelly / position sizing ───────────────────────────────────────────────────
-KELLY_FRACTION     = 0.40
+KELLY_FRACTION     = 0.70
 MAX_POSITION_PCT   = 0.70
 COMMISSION_RATE    = 0.001
 
@@ -170,3 +172,4 @@ TAKER_FEE = Decimal("0.001")
 LOOP_SLEEP_SECS    = 5
 BALANCE_SYNC_BARS  = 15
 ORDER_TIMEOUT_SECS = 30
+SYNC_INTERVAL_SECS = 300   # ← NEW: balance + position reconcile every 5 min

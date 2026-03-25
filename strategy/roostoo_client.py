@@ -6,6 +6,16 @@ Only exposes the three operations used by this project:
   - get_balance
   - cancel_order
   - query_order  (for diagnostics / fill confirmation)
+
+Fix 1 — quantity step size error
+  Added get_exchange_info() and _load_amount_precision() so that place_order()
+  rounds quantity to Roostoo's per-pair AmountPrecision (e.g. BNB/USD = 2 d.p.)
+  instead of a hard-coded 6, preventing 'quantity step size error' rejections.
+
+Fix 2 — _sign() return-type annotation corrected (tuple[dict, str] → tuple[dict, str, str])
+
+Fix 3 — free_usd / free_btc / total_portfolio_usd now handle both the
+  live-API 'SpotWallet' key and the documented 'Wallet' key defensively.
 """
 
 from __future__ import annotations
@@ -15,7 +25,7 @@ import hmac
 import logging
 import time
 from typing import Any
-
+import config as cfg
 import requests
 
 logger = logging.getLogger(__name__)
@@ -31,8 +41,8 @@ class RoostooClient:
 
     def __init__(
         self,
-        api_key:    str = "4mBXHQ2ihr5gos7S9dDiXcoxPFNu9RKyoXH91dgXIfqzYI4gjtsUKZGNRAncww91",
-        secret_key: str = "Xyvcu2WL8BtDGfflvePuLYa8P4ZkZ3Pv9THbGfbmP8qAiH4dwJWqz8nVlZOzTA7M",
+        api_key:    str = cfg.ROOSTOO_API_KEY,
+        secret_key: str = cfg.ROOSTOO_SECRET_KEY,
         base_url:   str = "https://mock-api.roostoo.com",
         timeout:    int = 15,
     ) -> None:
@@ -42,16 +52,22 @@ class RoostooClient:
         self._timeout    = timeout
         self._session    = requests.Session()
 
+        # Per-pair AmountPrecision fetched from /v3/exchangeInfo on init.
+        # place_order() rounds quantity to this precision before sending.
+        # Falls back to 6 for any pair not found in the response.
+        self._amount_precision: dict[str, int] = {}
+        self._load_amount_precision()
+
     # ── Auth helpers ──────────────────────────────────────────────────────────
 
     @staticmethod
     def _timestamp() -> str:
         return str(int(time.time() * 1000))
 
-    def _sign(self, params: dict) -> tuple[dict, str]:
+    def _sign(self, params: dict) -> tuple[dict, str, str]:
         """
         Add timestamp, build sorted query string, compute HMAC-SHA256.
-        Returns (signed_params, total_params_string).
+        Returns (signed_params, total_params_string, signature).
         """
         params["timestamp"] = self._timestamp()
         total = "&".join(f"{k}={params[k]}" for k in sorted(params))
@@ -64,6 +80,53 @@ class RoostooClient:
             "MSG-SIGNATURE":   sig,
             "Content-Type":    "application/x-www-form-urlencoded",
         }
+
+    # ── Exchange info (public, no auth) ───────────────────────────────────────
+
+    def get_exchange_info(self) -> dict[str, Any] | None:
+        """
+        GET /v3/exchangeInfo  (Auth: RCL_NoVerification)
+        Returns trading rules including per-pair AmountPrecision and MiniOrder.
+        No authentication required.
+        """
+        try:
+            r = self._session.get(
+                f"{self._base_url}/v3/exchangeInfo",
+                timeout=self._timeout,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:
+            logger.error("get_exchange_info failed: %s", exc)
+            return None
+
+    def _load_amount_precision(self) -> None:
+        """
+        Populate self._amount_precision from /v3/exchangeInfo.
+
+        The Roostoo API enforces an AmountPrecision per pair — for example,
+        BNB/USD allows only 2 decimal places.  Sending more decimals returns
+        'quantity step size error'.  This method fetches the live rules once
+        at construction time so place_order() can truncate correctly.
+
+        Falls back silently to precision=6 for any pair whose info cannot
+        be loaded (e.g. network error at startup).
+        """
+        info = self.get_exchange_info()
+        if not info:
+            logger.warning(
+                "Could not load Roostoo exchangeInfo at startup — "
+                "defaulting to AmountPrecision=6 for all pairs.  "
+                "Orders may be rejected if the true precision is stricter."
+            )
+            return
+        for pair, meta in info.get("TradePairs", {}).items():
+            self._amount_precision[pair] = int(meta.get("AmountPrecision", 6))
+        logger.info("Roostoo AmountPrecision per pair: %s", self._amount_precision)
+
+    def _pair_amount_precision(self, pair: str) -> int:
+        """Return the AmountPrecision for pair, defaulting to 6 if unknown."""
+        return self._amount_precision.get(pair, 6)
 
     # ── Public API calls ──────────────────────────────────────────────────────
 
@@ -102,17 +165,27 @@ class RoostooClient:
         side:       "BUY" | "SELL"
         order_type: "MARKET" | "LIMIT"  (auto-detected if None)
         price:      required only for LIMIT orders
+
+        Quantity is rounded to the Roostoo-specified AmountPrecision for this
+        pair before the request is sent, preventing 'quantity step size error'
+        rejections that occur when too many decimal places are submitted.
         """
         if order_type is None:
             order_type = "LIMIT" if price is not None else "MARKET"
         if order_type == "LIMIT" and price is None:
             raise ValueError("price required for LIMIT orders")
 
+        # ── Round to this pair's AmountPrecision ──────────────────────────────
+        # e.g. BNB/USD: AmountPrecision=2 → round(620.607171, 2) = "620.61"
+        #      BTC/USD: AmountPrecision=6 → round(3.392237, 6)   = "3.392237"
+        prec    = self._pair_amount_precision(pair)
+        qty_str = str(round(quantity, prec))
+
         payload: dict[str, Any] = {
             "pair":     pair,
             "side":     side.upper(),
             "type":     order_type.upper(),
-            "quantity": str(round(quantity, 6)),
+            "quantity": qty_str,
         }
         if order_type == "LIMIT":
             payload["price"] = str(price)
@@ -134,7 +207,7 @@ class RoostooClient:
                     "Order placed | id=%s status=%s side=%s qty=%s price=%s",
                     detail.get("OrderID"),
                     detail.get("Status"),
-                    side, quantity,
+                    side, qty_str,
                     detail.get("FilledAverPrice", "—"),
                 )
             else:
@@ -214,23 +287,31 @@ class RoostooClient:
 
     # ── Convenience helpers ───────────────────────────────────────────────────
 
+    @staticmethod
+    def _wallet_from(data: dict) -> dict:
+        """
+        Extract the wallet sub-dict from a balance response.
+        Handles both the live-API 'SpotWallet' key and the documented 'Wallet' key.
+        """
+        return data.get("SpotWallet") or data.get("Wallet") or {}
+
     def free_usd(self) -> float:
         data = self.get_balance()
         if not data or not data.get("Success"):
             return 0.0
-        return float(data["SpotWallet"].get("USD", {}).get("Free", 0.0))
+        return float(self._wallet_from(data).get("USD", {}).get("Free", 0.0))
 
     def free_btc(self) -> float:
         data = self.get_balance()
         if not data or not data.get("Success"):
             return 0.0
-        return float(data["SpotWallet"].get("BTC", {}).get("Free", 0.0))
+        return float(self._wallet_from(data).get("BTC", {}).get("Free", 0.0))
 
     def total_portfolio_usd(self, btc_price: float) -> float:
         data = self.get_balance()
         if not data or not data.get("Success"):
             return 0.0
-        wallet = data["SpotWallet"]
+        wallet = self._wallet_from(data)
         usd = float(wallet.get("USD", {}).get("Free", 0.0)) + \
               float(wallet.get("USD", {}).get("Lock", 0.0))
         btc = float(wallet.get("BTC", {}).get("Free", 0.0)) + \
