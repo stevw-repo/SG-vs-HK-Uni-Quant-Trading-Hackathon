@@ -58,14 +58,16 @@ TRADING_INSTRUMENTS: list[tuple[str, str]] = [
     ("ETHUSDT", "ETH/USD"),
     ("BNBUSDT", "BNB/USD"),
     # ── Add any pair below — no other files need to change ──────────────────
-    # ("SOLUSDT",   "SOL/USD"),
-    # ("XRPUSDT",   "XRP/USD"),
+    ("SOLUSDT",   "SOL/USD"),
+    ("XRPUSDT",   "XRP/USD"),
     ("DOGEUSDT",  "DOGE/USD"),
-    # ("ADAUSDT",   "ADA/USD"),
+    ("ADAUSDT",   "ADA/USD"),
     ("AVAXUSDT",  "AVAX/USD"),
     ("DOTUSDT",   "DOT/USD"),
     ("LINKUSDT",  "LINK/USD"),
     ("LTCUSDT",   "LTC/USD"),
+    # ("TAOUSDT",   "TAO/USD"),
+    # ("FETUSDT",   "FET/USD"),
 ]
 
 # ── Bar specification ─────────────────────────────────────────────────────────
@@ -146,7 +148,7 @@ MIN_BULL_PROBA          = 0.45
 MIN_KELLY_FRACTION      = 0.005
 TREND_EMA_BARS          = 2
 TREND_LOOKBACK_BARS     = 4
-BULL_ENTRY_CONSECUTIVE  = 2
+BULL_ENTRY_CONSECUTIVE  = 1
 BEAR_EXIT_CONSECUTIVE   = 2
 
 # ── Kelly / position sizing ───────────────────────────────────────────────────
@@ -155,12 +157,12 @@ MAX_POSITION_PCT   = 0.70
 COMMISSION_RATE    = 0.001
 
 # ── Exit ──────────────────────────────────────────────────────────────────────
-TAKE_PROFIT_PCT    = 0.030
-TRAIL_BULL_PCT     = 0.020
-TRAIL_SIDEWAYS_PCT = 0.012
-TRAIL_BEAR_PCT     = 0.006
+TAKE_PROFIT_PCT    = 0.0025
+TRAIL_BULL_PCT     = 0.012
+TRAIL_SIDEWAYS_PCT = 0.008
+TRAIL_BEAR_PCT     = 0.004
 BEAR_EXIT_PROBA    = 0.40
-MAX_HOLDING_BARS   = 192
+MAX_HOLDING_BARS   = 500
 
 # ── Re-entry cooldown ─────────────────────────────────────────────────────────
 MIN_BARS_BETWEEN_TRADES = 8

@@ -118,7 +118,7 @@ class HMMStrategyConfig(StrategyConfig, frozen=True):
     trend_lookback_bars:     int   = 4
 
     # BULL entry persistence
-    bull_entry_consecutive:  int   = 2
+    bull_entry_consecutive:  int   = 1
 
     # Kelly / position sizing
     kelly_fraction:          float = 0.70
@@ -126,19 +126,19 @@ class HMMStrategyConfig(StrategyConfig, frozen=True):
     commission_rate:         float = 0.001
 
     # Exit — take-profit
-    take_profit_pct:         float = 0.030
+    take_profit_pct:         float = 0.0025
 
     # Exit — regime-adjusted trailing stops from peak
-    trail_bull_pct:          float = 0.020
-    trail_sideways_pct:      float = 0.012
-    trail_bear_pct:          float = 0.006
+    trail_bull_pct:          float = 0.012
+    trail_sideways_pct:      float = 0.008
+    trail_bear_pct:          float = 0.004
 
     # Exit — immediate close on persistent bear signal
     bear_exit_proba:         float = 0.40
     bear_exit_consecutive:   int   = 2
 
     # Maximum bars to hold a position (192 bars = 48 hours at 15-min)
-    max_holding_bars:        int   = 192
+    max_holding_bars:        int   = 500
 
     # Re-entry cooldown
     min_bars_between_trades: int   = 8
